@@ -1,0 +1,516 @@
+#Requires -Version 5.1
+<#
+.SYNOPSIS
+    Builds the Azure migration inventory sheet (one row per share / SFTP root) for on-prem Windows file servers.
+
+.DESCRIPTION
+    Connects to each server over WinRM (or runs locally) and collects, per SMB share and per SFTP chroot folder:
+      size, file/folder counts, hot/warm/cold split, largest file, top extensions, path-length and naming problems,
+      share + NTFS permission summary (local accounts, orphaned SIDs, Everyone, explicit/broken inheritance),
+      active SMB sessions/open files and client subnets (a snapshot, see notes).
+    Columns that only a human knows (owning app, user country, residency, RTO/RPO, target service...) are added blank.
+
+    Outputs (in -OutputFolder):
+      Inventory.csv    one row per share / SFTP root  (the inventory sheet)
+      Servers.csv      one row per server (OS, volumes, SFTP services, SMB1, client subnets, dedup, roles)
+      SftpConfig.csv   relevant sshd_config directives per server
+      Errors.csv       servers that could not be reached (only if any)
+      Inventory.xlsx   same as above as worksheets, only if the ImportExcel module is installed
+
+.PARAMETER ComputerName      Server names. Use '.' or 'localhost' to scan the machine you are on.
+.PARAMETER ServerListPath    Text file with one server per line ('#' = comment).
+.PARAMETER Credential        Optional credential with local admin rights on the servers.
+.PARAMETER HotDays           Data touched within this many days is "hot"  (default 90).
+.PARAMETER WarmDays          Data touched within this many days (but not hot) is "warm"; older is "cold" (default 365).
+.PARAMETER ExtraPath         Extra local paths to scan on every server where they exist (e.g. SFTP data folders that are not shared).
+.PARAMETER SkipFileScan      Only collect share/server/permission info, skip the slow recursive size scan.
+.PARAMETER NoLongPathPrefix  Do not use the \\?\ prefix when enumerating (use if you see lots of enumeration errors).
+.PARAMETER ThrottleLimit     How many servers to scan in parallel (default 4).
+
+.EXAMPLE
+    .\Get-FileServerInventory.ps1 -ServerListPath .\servers.txt -OutputFolder D:\Inventory
+
+.EXAMPLE
+    # Quick first pass without the recursive scan
+    .\Get-FileServerInventory.ps1 -ComputerName FS01,FS02 -SkipFileScan
+
+.NOTES
+    * Run from an elevated PowerShell; the account needs local admin on the targets and WinRM must be enabled
+      (Enable-PSRemoting). Works on Windows PowerShell 5.1, which ships with Server 2016/2019/2025.
+    * The recursive scan is read-only but can take hours on servers with tens of millions of files and adds I/O load.
+      Run it out of hours, or run the script locally on the heaviest servers (-ComputerName localhost).
+    * Hot/warm/cold uses LastAccessTime only if NTFS last-access updates are enabled on the server; otherwise it falls
+      back to LastWriteTime (the HotWarmColdBasis column says which). Antivirus and backup scans can distort LastAccessTime.
+    * SMB sessions/open files are a point-in-time snapshot. Run the script at a few different times (or enable
+      SMB audit / event 5140) before concluding that a share is unused.
+    * If a volume uses Data Deduplication, sizes are logical (what will be copied), not what is on disk.
+#>
+[CmdletBinding()]
+param(
+    [string[]]$ComputerName,
+    [string]$ServerListPath,
+    [pscredential]$Credential,
+    [string]$OutputFolder = (Join-Path (Get-Location) ("FileServerInventory_{0:yyyyMMdd_HHmm}" -f (Get-Date))),
+    [int]$HotDays = 90,
+    [int]$WarmDays = 365,
+    [string[]]$ExtraPath = @(),
+    [switch]$SkipFileScan,
+    [switch]$NoLongPathPrefix,
+    [int]$ThrottleLimit = 4
+)
+
+$ErrorActionPreference = 'Stop'
+
+# ----------------------------------------------------------------------------------------------
+# Server list
+# ----------------------------------------------------------------------------------------------
+$ComputerName = @($ComputerName)
+if ($ServerListPath) {
+    $ComputerName += Get-Content -LiteralPath $ServerListPath |
+        ForEach-Object { $_.Trim() } |
+        Where-Object { $_ -and -not $_.StartsWith('#') }
+}
+$ComputerName = @($ComputerName | Where-Object { $_ } | Sort-Object -Unique)
+if (-not $ComputerName) { $ComputerName = @($env:COMPUTERNAME) }
+
+$localAliases = @('.', 'localhost', $env:COMPUTERNAME)
+$localNames  = @($ComputerName | Where-Object { $localAliases -contains $_ -or $_ -like "$($env:COMPUTERNAME).*" })
+$remoteNames = @($ComputerName | Where-Object { $localNames -notcontains $_ })
+
+New-Item -ItemType Directory -Path $OutputFolder -Force | Out-Null
+
+# ----------------------------------------------------------------------------------------------
+# Code that runs ON each server
+# ----------------------------------------------------------------------------------------------
+$scan = {
+    param(
+        [int]$HotDays,
+        [int]$WarmDays,
+        [bool]$SkipFileScan,
+        [bool]$UseLongPathPrefix,
+        [string[]]$ExtraPath
+    )
+    $ErrorActionPreference = 'Continue'
+    $now     = Get-Date
+    $hotCut  = $now.AddDays(-$HotDays)
+    $warmCut = $now.AddDays(-$WarmDays)
+    $server  = $env:COMPUTERNAME
+    $warnings = New-Object System.Collections.Generic.List[string]
+
+    function Round-GB([double]$b) { [math]::Round($b / 1GB, 2) }
+
+    # ---- recursive size / age scan (explicit stack: survives access-denied folders) ------------
+    function Measure-Tree {
+        param([string]$Root, [bool]$UseAccess, [datetime]$HotCut, [datetime]$WarmCut, [bool]$LongPrefix)
+
+        $scanRoot = $Root
+        $prefixLen = 0
+        if ($LongPrefix -and $Root -match '^[A-Za-z]:\\') { $scanRoot = '\\?\' + $Root; $prefixLen = 4 }
+
+        $files = 0L; $folders = 0L; $bytes = 0L; $hot = 0L; $warm = 0L; $cold = 0L
+        $errs = 0; $reparse = 0; $long = 0; $badName = 0; $largest = 0L
+        $newest = [datetime]::MinValue; $oldest = [datetime]::MaxValue
+        $ext = @{}
+
+        $stack = New-Object 'System.Collections.Generic.Stack[System.IO.DirectoryInfo]'
+        $stack.Push((New-Object System.IO.DirectoryInfo($scanRoot)))
+
+        while ($stack.Count -gt 0) {
+            $dir = $stack.Pop()
+            try {
+                foreach ($e in $dir.EnumerateFileSystemInfos()) {
+                    if (($e.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { $reparse++; continue }
+                    if ($e -is [System.IO.DirectoryInfo]) { $folders++; $stack.Push($e); continue }
+
+                    $len = [int64]$e.Length
+                    $files++
+                    $bytes += $len
+                    if ($len -gt $largest) { $largest = $len }
+
+                    $w = $e.LastWriteTime
+                    if ($w -gt $newest) { $newest = $w }
+                    if ($w -lt $oldest) { $oldest = $w }
+
+                    if ($UseAccess) { $t = $e.LastAccessTime } else { $t = $w }
+                    if ($t -ge $HotCut)       { $hot  += $len }
+                    elseif ($t -ge $WarmCut)  { $warm += $len }
+                    else                      { $cold += $len }
+
+                    $x = $e.Extension.ToLowerInvariant()
+                    $ext[$x] = $ext[$x] + $len
+
+                    if (($e.FullName.Length - $prefixLen) -ge 260) { $long++ }
+                    $n = $e.Name
+                    if ($n.EndsWith(' ') -or $n.EndsWith('.')) { $badName++ }
+                }
+            }
+            catch { $errs++ }
+        }
+
+        $top = ($ext.GetEnumerator() | Sort-Object Value -Descending | Select-Object -First 5 | ForEach-Object {
+            $k = if ($_.Key) { $_.Key } else { '(none)' }
+            '{0}={1}MB' -f $k, [math]::Round($_.Value / 1MB, 0)
+        }) -join '; '
+
+        [pscustomobject]@{
+            Files = $files; Folders = $folders; Bytes = $bytes; Hot = $hot; Warm = $warm; Cold = $cold
+            Errors = $errs; Reparse = $reparse; Long = $long; BadName = $badName; Largest = $largest
+            Newest = $(if ($files) { $newest.ToString('yyyy-MM-dd') } else { '' })
+            Oldest = $(if ($files) { $oldest.ToString('yyyy-MM-dd') } else { '' })
+            TopExt = $top
+        }
+    }
+
+    # ---- NTFS permission summary ----------------------------------------------------------------
+    function Get-AclSummary {
+        param([string]$Path)
+        $r = [ordered]@{
+            Owner = ''; RootAcl = ''; Identities = 0; Local = 0; Orphan = 0; Broad = ''
+            L1Checked = 0; L1Explicit = 0; L1Protected = 0
+        }
+        try {
+            $ids = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+            $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
+            $r.Owner = $acl.Owner
+            $rootRules = foreach ($a in $acl.Access) {
+                [void]$ids.Add($a.IdentityReference.Value)
+                '{0}:{1}:{2}{3}' -f $a.IdentityReference.Value, $a.FileSystemRights, $a.AccessControlType, $(if ($a.IsInherited) { '(inh)' } else { '' })
+            }
+            $s = ($rootRules | Select-Object -First 25) -join ' | '
+            if ($s.Length -gt 1500) { $s = $s.Substring(0, 1500) + '...' }
+            $r.RootAcl = $s
+
+            $level1 = @(Get-ChildItem -LiteralPath $Path -Directory -Force -ErrorAction SilentlyContinue | Select-Object -First 500)
+            foreach ($d in $level1) {
+                try {
+                    $da = Get-Acl -LiteralPath $d.FullName -ErrorAction Stop
+                    $r.L1Checked++
+                    if ($da.AreAccessRulesProtected) { $r.L1Protected++ }
+                    $explicit = @($da.Access | Where-Object { -not $_.IsInherited })
+                    if ($explicit.Count -gt 0) { $r.L1Explicit++ }
+                    foreach ($a in $explicit) { [void]$ids.Add($a.IdentityReference.Value) }
+                } catch { }
+            }
+
+            $r.Identities = $ids.Count
+            $r.Local  = @($ids | Where-Object { $_ -like "$server\*" }).Count
+            $r.Orphan = @($ids | Where-Object { $_ -match '^S-1-5-21-' }).Count
+            $r.Broad  = (@($ids | Where-Object { $_ -in 'Everyone', 'NT AUTHORITY\Authenticated Users' }) -join ';')
+        }
+        catch { $warnings.Add("ACL read failed for ${Path}: $($_.Exception.Message)") }
+        [pscustomobject]$r
+    }
+
+    # ---- server level facts ---------------------------------------------------------------------
+    $os = $null; $cs = $null
+    try { $os = Get-CimInstance Win32_OperatingSystem; $cs = Get-CimInstance Win32_ComputerSystem } catch { }
+
+    $laText = ''
+    try { $laText = (& fsutil behavior query disablelastaccess 2>&1 | Out-String) } catch { }
+    $useAccess = $false
+    if ($laText -match 'DisableLastAccess\s*=\s*(\d)') { $useAccess = ([int]$Matches[1] -in 0, 2) }
+
+    $volumes = ''
+    try {
+        $volumes = (Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' | ForEach-Object {
+            '{0} {1}/{2}GB used' -f $_.DeviceID, (Round-GB ($_.Size - $_.FreeSpace)), (Round-GB $_.Size)
+        }) -join '; '
+    } catch { }
+
+    $features = ''
+    try {
+        $features = (Get-WindowsFeature -Name FS-FileServer, FS-DFS-Namespace, FS-DFS-Replication, FS-Resource-Manager,
+                      FS-Data-Deduplication, FS-SyncShareService, Web-Ftp-Server, FS-BranchCache -ErrorAction Stop |
+                      Where-Object { $_.Installed } | ForEach-Object { $_.Name }) -join '; '
+    } catch { }
+
+    $dedup = ''
+    try {
+        if (Get-Command Get-DedupVolume -ErrorAction SilentlyContinue) {
+            $dedup = (Get-DedupVolume | ForEach-Object { '{0} saved {1}GB ({2}%)' -f $_.Volume, (Round-GB $_.SavedSpace), $_.SavingsRate }) -join '; '
+        }
+    } catch { }
+
+    # SFTP / FTP services and listeners
+    $sftpSvc = ''
+    try {
+        $sftpSvc = (Get-CimInstance Win32_Service |
+            Where-Object { $_.Name -match '^(sshd|FTPSVC|Serv-U|FileZilla|BvSshServer|CoreFTP|WS_FTP|Cerberus|EFT|GlobalSCAPE|MOVEit|FTPServer)' -or
+                           $_.DisplayName -match 'SFTP|SSH Server|OpenSSH SSH Server|FTP Server|FileZilla|Bitvise|Cerberus|Serv-U|MOVEit' } |
+            ForEach-Object { '{0} [{1}/{2}]' -f $_.Name, $_.State, $_.StartMode }) -join '; '
+    } catch { }
+
+    $ports = ''
+    try {
+        $ports = (Get-NetTCPConnection -State Listen -ErrorAction Stop | Where-Object { $_.LocalPort -in 21, 22, 990, 2222 } |
+            Group-Object LocalPort | ForEach-Object {
+                $pid0 = ($_.Group | Select-Object -First 1).OwningProcess
+                $pn = (Get-Process -Id $pid0 -ErrorAction SilentlyContinue).ProcessName
+                '{0} ({1})' -f $_.Name, $pn
+            }) -join '; '
+    } catch { }
+
+    # sshd_config (OpenSSH for Windows)
+    $sshCfgPath = Join-Path $env:ProgramData 'ssh\sshd_config'
+    $sshCfgFound = Test-Path -LiteralPath $sshCfgPath
+    $sftpLines = New-Object System.Collections.Generic.List[string]
+    $chroots   = New-Object System.Collections.Generic.List[string]
+    if ($sshCfgFound) {
+        try {
+            foreach ($line in (Get-Content -LiteralPath $sshCfgPath)) {
+                $l = $line.Trim()
+                if ($l -match '^(ChrootDirectory|ForceCommand|Subsystem\s+sftp|Match\s|PasswordAuthentication|PubkeyAuthentication|AllowUsers|AllowGroups|DenyUsers|DenyGroups|Port\s|AuthorizedKeysFile)') {
+                    $sftpLines.Add($l)
+                    if ($l -match '^ChrootDirectory\s+(.+)$') {
+                        $p = $Matches[1].Trim().Trim('"')
+                        if ($p -match '%') { $warnings.Add("ChrootDirectory uses a token ($p): per-user folders, scan them via -ExtraPath or check manually") }
+                        elseif (Test-Path -LiteralPath $p) { $chroots.Add($p) }
+                        else { $warnings.Add("ChrootDirectory not found: $p") }
+                    }
+                }
+            }
+        } catch { $warnings.Add("Could not read sshd_config: $($_.Exception.Message)") }
+    }
+
+    $localUsers = ''
+    try { $localUsers = (Get-LocalUser | Where-Object { $_.Enabled } | Select-Object -First 25 -ExpandProperty Name) -join '; ' } catch { }
+
+    # SMB config + sessions (snapshot)
+    $smb1 = ''
+    try { $smb1 = [string](Get-SmbServerConfiguration).EnableSMB1Protocol } catch { }
+    $sessions = @(); $openFiles = @()
+    try { $sessions  = @(Get-SmbSession) }  catch { }
+    try { $openFiles = @(Get-SmbOpenFile) } catch { }
+
+    $legacySess = 0
+    foreach ($s in $sessions) { try { if ([version]$s.Dialect -lt [version]'3.0') { $legacySess++ } } catch { } }
+    $subnets = ($sessions | ForEach-Object {
+        $c = [string]$_.ClientComputerName
+        if ($c -match '^(\d{1,3}\.\d{1,3}\.\d{1,3})\.\d{1,3}$') { "$($Matches[1]).0/24" } else { $c }
+    } | Sort-Object -Unique | Select-Object -First 30) -join '; '
+
+    # ---- scan targets: SMB shares + SFTP chroots + extra paths ---------------------------------
+    $targets = New-Object System.Collections.Generic.List[object]
+    function Add-Target {
+        param([string]$Path, [string]$Name, [string]$Source, [string]$Desc, [string]$Perms, [string]$Encrypt)
+        $key = $Path.TrimEnd('\').ToLowerInvariant()
+        $t = $targets | Where-Object { $_.Key -eq $key } | Select-Object -First 1
+        if (-not $t) {
+            $t = [pscustomobject]@{
+                Key = $key; Path = $Path.TrimEnd('\'); Names = (New-Object System.Collections.Generic.List[string])
+                Sources = (New-Object System.Collections.Generic.List[string]); Desc = ''; Perms = ''; Encrypt = ''
+            }
+            $targets.Add($t)
+        }
+        if ($Name   -and -not $t.Names.Contains($Name))     { $t.Names.Add($Name) }
+        if ($Source -and -not $t.Sources.Contains($Source)) { $t.Sources.Add($Source) }
+        if ($Desc)    { $t.Desc = $Desc }
+        if ($Perms)   { $t.Perms = $Perms }
+        if ($Encrypt) { $t.Encrypt = $Encrypt }
+    }
+
+    try {
+        foreach ($sh in (Get-SmbShare -Special $false | Where-Object { $_.Path -and $_.ShareType -eq 'FileSystemDirectory' })) {
+            if (-not (Test-Path -LiteralPath $sh.Path)) { $warnings.Add("Share $($sh.Name) path missing: $($sh.Path)"); continue }
+            $perm = ''
+            try { $perm = (Get-SmbShareAccess -Name $sh.Name | ForEach-Object { '{0}:{1}:{2}' -f $_.AccountName, $_.AccessRight, $_.AccessControlType }) -join ' | ' } catch { }
+            Add-Target -Path $sh.Path -Name $sh.Name -Source 'SMB' -Desc $sh.Description -Perms $perm -Encrypt ([string]$sh.EncryptData)
+        }
+    } catch { $warnings.Add("Get-SmbShare failed: $($_.Exception.Message)") }
+
+    foreach ($c in $chroots)   { Add-Target -Path $c -Name '' -Source 'SFTP' -Desc '' -Perms '' -Encrypt '' }
+    foreach ($x in $ExtraPath) { if (Test-Path -LiteralPath $x) { Add-Target -Path $x -Name '' -Source 'ExtraPath' -Desc '' -Perms '' -Encrypt '' } }
+
+    function Test-Overlap([string]$a, [string]$b) {
+        $a = $a.TrimEnd('\').ToLowerInvariant(); $b = $b.TrimEnd('\').ToLowerInvariant()
+        ($a -eq $b) -or $a.StartsWith($b + '\') -or $b.StartsWith($a + '\')
+    }
+
+    # ---- one inventory row per target -----------------------------------------------------------
+    $rows = New-Object System.Collections.Generic.List[object]
+    foreach ($t in $targets) {
+        $m = $null
+        if (-not $SkipFileScan) { $m = Measure-Tree -Root $t.Path -UseAccess $useAccess -HotCut $hotCut -WarmCut $warmCut -LongPrefix $UseLongPathPrefix }
+        $acl = Get-AclSummary -Path $t.Path
+
+        $vSize = ''; $vUsed = ''
+        try {
+            $di = New-Object System.IO.DriveInfo($t.Path.Substring(0, 1))
+            $vSize = Round-GB $di.TotalSize; $vUsed = Round-GB ($di.TotalSize - $di.TotalFreeSpace)
+        } catch { }
+
+        # protocols: SMB if shared; SFTP if it is (or overlaps) an sshd chroot
+        $proto = New-Object System.Collections.Generic.List[string]
+        if ($t.Sources -contains 'SMB') { $proto.Add('SMB') }
+        if (($t.Sources -contains 'SFTP') -or (@($chroots | Where-Object { Test-Overlap $_ $t.Path }).Count -gt 0)) { $proto.Add('SFTP') }
+        if ($proto.Count -eq 0) { $proto.Add('Unknown') }
+
+        $myOpen = @($openFiles | Where-Object { $_.Path -and $_.Path.StartsWith($t.Path + '\', [StringComparison]::OrdinalIgnoreCase) })
+        $openUsers   = ($myOpen | ForEach-Object { $_.ClientUserName }     | Sort-Object -Unique | Select-Object -First 10) -join '; '
+        $openClients = ($myOpen | ForEach-Object { $_.ClientComputerName } | Sort-Object -Unique | Select-Object -First 10) -join '; '
+
+        $rows.Add([pscustomobject]@{
+            Server                   = $server
+            OS                       = if ($os) { $os.Caption } else { '' }
+            ShareName                = ($t.Names -join '; ')
+            Source                   = ($t.Sources -join '; ')
+            Path                     = $t.Path
+            Description              = $t.Desc
+            Protocols                = ($proto -join ';')
+            VolumeSizeGB             = $vSize
+            VolumeUsedGB             = $vUsed
+            TotalSizeGB              = if ($m) { Round-GB $m.Bytes } else { '' }
+            FileCount                = if ($m) { $m.Files } else { '' }
+            FolderCount              = if ($m) { $m.Folders } else { '' }
+            AvgFileSizeKB            = if ($m -and $m.Files) { [math]::Round($m.Bytes / $m.Files / 1KB, 1) } else { '' }
+            LargestFileGB            = if ($m) { Round-GB $m.Largest } else { '' }
+            HotGB                    = if ($m) { Round-GB $m.Hot } else { '' }
+            WarmGB                   = if ($m) { Round-GB $m.Warm } else { '' }
+            ColdGB                   = if ($m) { Round-GB $m.Cold } else { '' }
+            ColdPercent              = if ($m -and $m.Bytes) { [math]::Round(100 * $m.Cold / $m.Bytes, 1) } else { '' }
+            HotWarmColdBasis         = if ($useAccess) { "LastAccessTime (hot<=${HotDays}d, cold>${WarmDays}d)" } else { "LastWriteTime (hot<=${HotDays}d, cold>${WarmDays}d)" }
+            NewestModified           = if ($m) { $m.Newest } else { '' }
+            OldestModified           = if ($m) { $m.Oldest } else { '' }
+            PathsOver260Chars        = if ($m) { $m.Long } else { '' }
+            NamesEndingDotOrSpace    = if ($m) { $m.BadName } else { '' }
+            ReparsePointsSkipped     = if ($m) { $m.Reparse } else { '' }
+            EnumerationErrors        = if ($m) { $m.Errors } else { '' }
+            TopExtensionsBySize      = if ($m) { $m.TopExt } else { '' }
+            SharePermissions         = $t.Perms
+            ShareEncryptData         = $t.Encrypt
+            NtfsOwner                = $acl.Owner
+            NtfsRootAcl              = $acl.RootAcl
+            DistinctIdentities       = $acl.Identities
+            LocalAccountsInAcl       = $acl.Local
+            OrphanedSidsInAcl        = $acl.Orphan
+            BroadAccess              = $acl.Broad
+            TopFoldersChecked        = $acl.L1Checked
+            TopFoldersExplicitAcl    = $acl.L1Explicit
+            TopFoldersInheritanceOff = $acl.L1Protected
+            ActiveOpenFiles          = $myOpen.Count
+            ActiveUsersSample        = $openUsers
+            ActiveClientsSample      = $openClients
+        })
+    }
+
+    $srv = [pscustomobject]@{
+        Server                = $server
+        OS                    = if ($os) { $os.Caption } else { '' }
+        OSVersion             = if ($os) { $os.Version } else { '' }
+        Domain                = if ($cs) { $cs.Domain } else { '' }
+        PartOfDomain          = if ($cs) { $cs.PartOfDomain } else { '' }
+        Volumes               = $volumes
+        LastAccessUpdates     = if ($useAccess) { 'Enabled' } else { 'Disabled (LastWriteTime used)' }
+        DedupVolumes          = $dedup
+        InstalledRoles        = $features
+        SftpFtpServices       = $sftpSvc
+        ListeningPorts_21_22_990_2222 = $ports
+        SshdConfigFound       = $sshCfgFound
+        SftpChrootDirs        = ($chroots -join '; ')
+        EnabledLocalUsers     = $localUsers
+        Smb1Enabled           = $smb1
+        SmbSessionsNow        = $sessions.Count
+        SmbSessionsBelowSmb3  = $legacySess
+        SmbClientSubnets      = $subnets
+        Warnings              = ($warnings -join ' || ')
+    }
+
+    [pscustomobject]@{
+        Server = $server
+        Info   = $srv
+        Shares = @($rows)
+        Sftp   = @($sftpLines | ForEach-Object { [pscustomobject]@{ Server = $server; Directive = $_ } })
+    }
+}
+
+# ----------------------------------------------------------------------------------------------
+# Run it
+# ----------------------------------------------------------------------------------------------
+$argList = @($HotDays, $WarmDays, $SkipFileScan.IsPresent, (-not $NoLongPathPrefix.IsPresent), [string[]]$ExtraPath)
+$results = @()
+$errors  = @()
+
+if ($remoteNames.Count -gt 0) {
+    Write-Host "Scanning $($remoteNames.Count) remote server(s): $($remoteNames -join ', ')" -ForegroundColor Cyan
+    $icm = @{
+        ComputerName  = $remoteNames
+        ScriptBlock   = $scan
+        ArgumentList  = $argList
+        ThrottleLimit = $ThrottleLimit
+        SessionOption = (New-PSSessionOption -OperationTimeout 0 -OpenTimeout 60000 -CancelTimeout 60000)
+        ErrorAction   = 'SilentlyContinue'
+        ErrorVariable = 'icmErr'
+    }
+    if ($Credential) { $icm.Credential = $Credential }
+    $results += @(Invoke-Command @icm)
+    foreach ($e in @($icmErr)) {
+        $errors += [pscustomobject]@{ Target = "$($e.TargetObject)"; Message = $e.Exception.Message }
+    }
+}
+
+if ($localNames.Count -gt 0) {
+    Write-Host "Scanning local server $env:COMPUTERNAME" -ForegroundColor Cyan
+    try { $results += @(& $scan @argList) }
+    catch { $errors += [pscustomobject]@{ Target = $env:COMPUTERNAME; Message = $_.Exception.Message } }
+}
+
+# ----------------------------------------------------------------------------------------------
+# Flatten + export
+# ----------------------------------------------------------------------------------------------
+$inventoryCols = @(
+    'Server', 'OS', 'ShareName', 'Source', 'Path', 'Description', 'Protocols',
+    'VolumeSizeGB', 'VolumeUsedGB', 'TotalSizeGB', 'FileCount', 'FolderCount', 'AvgFileSizeKB', 'LargestFileGB',
+    'HotGB', 'WarmGB', 'ColdGB', 'ColdPercent', 'HotWarmColdBasis', 'NewestModified', 'OldestModified',
+    'PathsOver260Chars', 'NamesEndingDotOrSpace', 'ReparsePointsSkipped', 'EnumerationErrors', 'TopExtensionsBySize',
+    'SharePermissions', 'ShareEncryptData', 'NtfsOwner', 'NtfsRootAcl', 'DistinctIdentities', 'LocalAccountsInAcl',
+    'OrphanedSidsInAcl', 'BroadAccess', 'TopFoldersChecked', 'TopFoldersExplicitAcl', 'TopFoldersInheritanceOff',
+    'ActiveOpenFiles', 'ActiveUsersSample', 'ActiveClientsSample'
+)
+# Columns only a person can fill in
+$manualCols = @(
+    'OwningApp', 'BusinessOwner', 'UserCountry', 'ApproxUserCount', 'DataResidencyConstraint',
+    'RetentionOrLegalHold', 'RTO', 'RPO', 'TargetAzureService', 'TargetRegion', 'MigrationWave', 'Notes'
+)
+
+$inventory = foreach ($r in $results) {
+    foreach ($row in @($r.Shares)) {
+        foreach ($c in $manualCols) { Add-Member -InputObject $row -NotePropertyName $c -NotePropertyValue '' -Force }
+        $row | Select-Object -Property ($inventoryCols + $manualCols)
+    }
+}
+$servers = foreach ($r in $results) { $r.Info }
+$sftp    = foreach ($r in $results) { $r.Sftp }
+
+$invPath = Join-Path $OutputFolder 'Inventory.csv'
+$srvPath = Join-Path $OutputFolder 'Servers.csv'
+$sftpPath = Join-Path $OutputFolder 'SftpConfig.csv'
+
+@($inventory) | Export-Csv -LiteralPath $invPath -NoTypeInformation -Encoding UTF8
+@($servers)   | Export-Csv -LiteralPath $srvPath -NoTypeInformation -Encoding UTF8
+@($sftp)      | Export-Csv -LiteralPath $sftpPath -NoTypeInformation -Encoding UTF8
+if ($errors.Count -gt 0) { $errors | Export-Csv -LiteralPath (Join-Path $OutputFolder 'Errors.csv') -NoTypeInformation -Encoding UTF8 }
+
+if (Get-Module -ListAvailable -Name ImportExcel) {
+    try {
+        Import-Module ImportExcel
+        $xlsx = Join-Path $OutputFolder 'Inventory.xlsx'
+        if (Test-Path $xlsx) { Remove-Item $xlsx -Force }
+        @($inventory) | Export-Excel -Path $xlsx -WorksheetName 'Inventory' -TableName 'Inventory' -AutoSize -FreezeTopRow
+        @($servers)   | Export-Excel -Path $xlsx -WorksheetName 'Servers'   -TableName 'Servers'   -AutoSize -FreezeTopRow
+        if (@($sftp).Count) { @($sftp) | Export-Excel -Path $xlsx -WorksheetName 'SftpConfig' -TableName 'SftpConfig' -AutoSize -FreezeTopRow }
+        Write-Host "Excel workbook: $xlsx" -ForegroundColor Green
+    } catch { Write-Warning "Excel export skipped: $($_.Exception.Message)" }
+}
+
+# ----------------------------------------------------------------------------------------------
+# Summary
+# ----------------------------------------------------------------------------------------------
+$totalGB = (@($inventory) | Where-Object { $_.TotalSizeGB -ne '' } | Measure-Object -Property TotalSizeGB -Sum).Sum
+Write-Host ''
+Write-Host ("Servers scanned OK : {0} of {1}" -f @($results).Count, $ComputerName.Count) -ForegroundColor Green
+Write-Host ("Inventory rows     : {0}" -f @($inventory).Count)
+if ($totalGB) { Write-Host ("Total data scanned : {0:N1} GB (shares overlapping each other are counted twice)" -f $totalGB) }
+if ($errors.Count -gt 0) {
+    Write-Host ("Failed servers     : {0} (see Errors.csv)" -f $errors.Count) -ForegroundColor Yellow
+}
+Write-Host "Output folder      : $OutputFolder"
